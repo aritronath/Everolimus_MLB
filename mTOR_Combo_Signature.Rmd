@@ -1,0 +1,248 @@
+---
+title: mTOR inhibitor combo Signature from ER+ cell lines treated with everolimus
+  and exemestane and response data from GSE119262
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r, cache=T}
+##### Load and process GSE119262 expression dataset and annotations
+# Expression 
+gse119262 <- read.delim("~/Desktop/Biomarkers/Data/GSE119262/GSE119262_series_matrix_V2.txt", comment.char="!", header=TRUE, fill=TRUE)
+
+# Header annotation 
+gse119262.annot <- read.delim("~/Desktop/Biomarkers/Data/GSE119262/GSE119262_series_matrix_V2.txt", header=FALSE, fill=TRUE, nrows=9)
+gse119262.annot <- t(gse119262.annot)
+gse119262.annot <- data.frame(gse119262.annot[-1, ])
+colnames(gse119262.annot) <- c("Patient", "ID_REF1", "HER2", "ER", "PR", "Response_AKT", "Ki67_Change", "Response_Ki67","ID_REF")
+
+gse119262.annot$Sample <- sapply(strsplit(as.character(gse119262.annot$Patient), ": |\\.|_"), "[", 1)
+gse119262.annot$PID <- sapply(strsplit(as.character(gse119262.annot$Patient), ": |\\.|_"), "[", 2)
+gse119262.annot$Time <- sapply(strsplit(as.character(gse119262.annot$Patient), ": |\\.|_"), "[", 3)
+gse119262.annot$Replicate <- sapply(strsplit(as.character(gse119262.annot$Patient), ": |\\.|_"), "[", 4)
+
+# Array information 
+gse119262.genes <- read.delim("~/Desktop/Biomarkers/Data/GSE119262/GPL6104-11576.txt", comment.char="#", header=TRUE)
+
+# Aggregate genes in expression matrix
+x <- match(gse119262$ID_REF, gse119262.genes$ID)
+agg.gse119262 <- aggregate(as.matrix(gse119262[ 2:ncol(gse119262)]), by=list(gse119262.genes$Symbol[x]), FUN=mean)
+gse119262.mat <- as.matrix(agg.gse119262[-c(1:4), 2:ncol(agg.gse119262)]) #not actual genes in first 4 rows
+rownames(gse119262.mat) <- agg.gse119262$Group.1[-c(1:4)]
+gse119262.s <- scale(t(gse119262.mat))
+```
+
+
+```{r Aggregate replicates}
+# Aggregate replicates 
+temp <- aggregate(gse119262.s, by=list(paste(gse119262.annot$PID, gse119262.annot$Time, sep="_")), FUN=mean)
+agg.pre <- as.matrix(temp[grep("Pre", temp$Group.1), 2:ncol(temp)])
+agg.post <- as.matrix(temp[grep("Post", temp$Group.1), 2:ncol(temp)])
+rownames(agg.pre) <- temp$Group.1[grep("Pre", temp$Group.1)]
+rownames(agg.post) <- temp$Group.1[grep("Post", temp$Group.1)]
+
+resp.pre <- as.factor(gse119262.annot$Response_Ki67[match(rownames(agg.pre), paste(gse119262.annot$PID, gse119262.annot$Time, sep="_"))]) # 1=Non-responder 2=Responder
+resp.post <- as.factor(gse119262.annot$Response_Ki67[match(rownames(agg.post), paste(gse119262.annot$PID, gse119262.annot$Time, sep="_"))]) # 1=Non-responder 2=Responder
+```
+
+```{r Integrated Feature Selection + Machine Learning, cache=T, echo=F}
+library(FCBF)
+library(caret)
+LOOCV.result <- matrix(data=NA, nrow=length(resp.pre), ncol=4)
+
+set.seed(1234)
+# Model using selected features 
+for (i in 1:length(resp.pre)) {
+  inTraining <- c(1:length(resp.pre))[-i] # LOOCV
+  
+  fcbf.res <- fcbf(discretize_exprs(agg.pre[inTraining, ]), 
+                   as.factor(resp.pre[inTraining]), 
+                   n_genes_selected_in_first_step = 50, 
+                   verbose=T, 
+                   samples_in_rows=T)
+  
+  fs.genes <- colnames(agg.pre)[fcbf.res$index]
+  Sig.genes <- intersect(c(BinReg_EvEx_t, BinReg_EvEx_h, fs.genes), colnames(agg.pre))
+  
+  temp.pre <- cbind(resp.pre, agg.pre[ , Sig.genes])
+  
+  training <- temp.pre[inTraining, ] 
+  testing  <- t(data.frame(temp.pre[i, ]))
+  
+  fitControl <- trainControl(method = "LOOCV")
+  rfFit1 <- train(as.factor(resp.pre) ~ ., data = training, 
+                  method = "rf", 
+                  trControl = fitControl,
+                  verbose = T)
+  
+  pred <- predict(rfFit1, newdata = testing, type = "prob")
+  LOOCV.result[i, ] <- c(rownames(temp.pre)[i], pred$`1`, pred$`2`, resp.pre[i])
+  
+  print(i)
+}
+
+save(LOOCV.result, file="~/Desktop/Biomarkers/mTOR/LOOCV.result.RDS")
+
+```
+
+
+```{r Make some plots, cache=T}
+
+df.LOOCV <- data.frame("PID" = LOOCV.result[,1], 
+                       "Pr_non_responder" = as.numeric(LOOCV.result[,2]),
+                       "Pr_responder" = as.numeric(LOOCV.result[,3]),
+                       "Actual_response" = resp.pre)
+
+pdf("~/Desktop/Biomarkers/mTOR/Figure_3_IntegratedProbabilities_Box.pdf", width=5, height=5)
+ggplot(df.LOOCV, aes(x=Actual_response, y=Pr_non_responder, fill=Actual_response)) +
+  geom_boxplot(width=0.5, show.legend = F) +
+  labs(x="Actual response", y="Probability of resistance") +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank()) +
+  scale_fill_manual(values=c("salmon", "lightblue"))
+                         
+ggplot(df.LOOCV, aes(x=Actual_response, y=Pr_responder, fill=Actual_response)) +
+  geom_boxplot(width=0.5, show.legend = F) +
+  labs(x="Actual response", y="Probability of response") +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank()) +
+  scale_fill_manual(values=c("salmon", "lightblue"))
+dev.off()
+
+pdf("~/Desktop/Biomarkers/mTOR/Figure_3_IntegratedProbabilities.pdf", width=7.5, height=5)
+ggplot(df.LOOCV, aes(x = Pr_responder)) + 
+  geom_density(aes(fill=Actual_response), show.legend = F) + 
+  geom_vline(xintercept = 0.5, col="grey50",  linetype = "dotted", size=1.5) +
+  facet_wrap(~Actual_response) + 
+  xlab("Probability of response") +
+  xlim(c(0,1)) +
+  theme_classic(base_size = 14) +
+  scale_fill_manual(values=c("salmon", "lightblue"))
+
+
+ggplot(df.LOOCV, aes(x = Pr_non_responder)) + 
+geom_density(aes(fill=Actual_response), show.legend = F) + 
+  geom_vline(xintercept = 0.5, col="grey50",  linetype = "dotted", size=1.5) +
+  facet_wrap(~Actual_response) + 
+  xlab("Probability of resistance") +
+  xlim(c(0,1)) +
+  theme_classic(base_size = 14) +
+  scale_fill_manual(values=c("salmon", "lightblue"))
+dev.off()
+
+LOOCV.pred <- factor(ifelse(df.LOOCV$Pr_responder >= .5, "ki67_response: Responder_Ki67", "ki67_response: Non-Responder_Ki67"))
+confusionMatrix(data = LOOCV.pred, reference = df.LOOCV$Actual_response)
+
+library(ROCR)
+pred1 <- array(0, dim=nrow(LOOCV.result))
+pred1[which(as.numeric(LOOCV.result[,3]) > as.numeric(LOOCV.result[,2]))] <- 1 
+
+label1 <- LOOCV.result[,4]
+label1 <- gsub("1", "0", label1)
+label1 <- gsub("2", "1", label1)
+
+pred <- prediction(list(pred1), label1)
+perf <- performance(pred,"tpr","fpr")
+plot(perf,colorize=TRUE)
+
+performance(pred, measure = "auc")@y.values[[1]]
+performance(pred, measure = "acc")@y.values[[1]]
+
+```
+
+
+```{r, Signature from full dataset, cache=T}
+library(FCBF)
+library(caret)
+set.seed(1234)
+fcbf.res <- fcbf(discretize_exprs(agg.pre), 
+                 as.factor(resp.pre), 
+                 n_genes_selected_in_first_step = 50, 
+                 verbose=T, 
+                 samples_in_rows=T)
+
+fs.genes.full <- colnames(agg.pre)[fcbf.res$index]
+Sig.genes.full <- intersect(c(BinReg_EvEx_t, BinReg_EvEx_h, fs.genes.full), colnames(agg.pre))
+
+fitControl <- trainControl(method = "LOOCV")
+rfFit.full <- train(as.factor(resp.pre) ~ ., data = cbind(resp.pre, agg.pre[, Sig.genes.full]), 
+                method = "rf", tuneGrid=data.frame(mtry=seq(1, 90, 1)),
+                trControl = fitControl,
+                verbose = T)
+
+print(rfFit.full)
+
+pdf("~/Desktop/Biomarkers/mTOR/Figure_3_FullLOOCV.pdf", width=7.5, height=5)
+plot(rfFit.full) 
+dev.off()
+#write.csv(data.frame(Sig.genes.full), file="~/Desktop/Biomarkers/mTOR/mTOR_Sig.genes.full_06202022.csv", quote = F)
+```
+
+```{r, For making predictions as biomarker}
+library(FCBF)
+library(caret)
+
+Sig.genes.full <- read.csv(file="~/Desktop/Biomarkers/mTOR/mTOR_Sig.genes.full.csv", header=T)
+saveRDS(Sig.genes.full$Sig.genes.full, file="MTOR.sig.genes.RDS")
+saveRDS(agg.pre, file="MTOR.pre.train.RDS")
+saveRDS(resp.pre, file="MTOR.resp.pre.train.RDS")
+
+MTOR.sig.genes <- readRDS(file="MTOR.sig.genes.RDS")
+MTOR.pre.train <- saveRDS(agg.pre, file="MTOR.pre.train.RDS")
+MTOR.resp.pre.train <- saveRDS(resp.pre, file="MTOR.resp.pre.train.RDS")
+
+fitControl <- trainControl(method = "LOOCV")
+rfFit.full <- train(as.factor(MTOR.resp.pre.train) ~ ., 
+                    data = cbind(MTOR.resp.pre.train, MTOR.pre.train[, MTOR.sig.genes]), 
+                method = "rf", tuneGrid=data.frame(mtry=seq(1, 90, 10)),
+                trControl = fitControl,
+                verbose = T)
+
+pred.MTOR <- predict(rfFit1, newdata = NEWDATA, type = "prob") #1=Non-responder 2=Responder
+
+```
+
+
+
+```{r, Enrichment analysis of the signatures}
+library(gprofiler2)
+
+gp_bin_1 <- gost(query = BinReg_EvEx_h, 
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = F, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = FALSE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = c("GO:BP", "REAC", "KEGG"), as_short_link = FALSE)
+
+
+gp_bin_2 <- gost(query = BinReg_EvEx_t, 
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = F, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = FALSE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = c("GO:BP", "REAC", "KEGG"), as_short_link = FALSE)
+
+write.table(apply(gp_bin_1$result, 2, as.character), sep="\t", file="~/Desktop/Biomarkers/mTOR/gp_bin_1.txt", quote=F, row.names=F)
+write.table(apply(gp_bin_2$result, 2, as.character), sep="\t", file="~/Desktop/Biomarkers/mTOR/gp_bin_2.txt", quote=F, row.names=F)
+
+```
+
+
+```{r, Plot gprofiler results}
+gop1 <- gostplot(gp_bin_1, capped = FALSE, interactive = F) 
+gop2 <- gostplot(gp_bin_2, capped = FALSE, interactive = F) 
+
+publish_gostplot(gop1, highlight_terms = c("GO:0006979", "GO:0042981",  
+                                           "KEGG:04216", "REAC:R-HSA-9664873"), 
+                        width = 7.5, height = 5.5, filename = "~/Desktop/Biomarkers/mTOR/gp_bin_1.pdf")
+
+publish_gostplot(gop2, highlight_terms = c("GO:0042254", "GO:0034470",  
+                                           "REAC:R-HSA-8953854"), 
+                       width = 7.5, height = 5, filename = "~/Desktop/Biomarkers/mTOR/gp_bin_2.pdf")
+
+```
